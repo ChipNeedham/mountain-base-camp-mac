@@ -9,3 +9,5 @@ build/
 # Swift
 DisplayPadController/.build/
 DisplayPadController/DisplayPadController.app/
+DisplayPadController/.swiftpm/xcode/xcuserdata/
+DisplayPadController/.swiftpm/xcode/package.xcworkspace/xcuserdata/

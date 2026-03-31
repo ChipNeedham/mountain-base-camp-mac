@@ -42,27 +42,38 @@ private func pushKeyIcon(manager: DisplayPadManager, keyIndex: Int, config: KeyC
             manager.setKeyText(keyIndex: keyIndex, text: config.label)
         }
     case .none:
-        // No icon source — use label as text
         manager.setKeyText(keyIndex: keyIndex, text: config.label.isEmpty ? "K\(keyIndex + 1)" : config.label)
     }
 }
 
 @main
 struct DisplayPadControllerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var manager = DisplayPadManager()
     @State private var configStore = ConfigStore()
     @State private var macroEngine = MacroEngine()
     @State private var hotplugMonitor = HotplugMonitor()
+    @State private var hasSetup = false
 
     var body: some Scene {
-        WindowGroup {
+        // Menu bar icon
+        MenuBarExtra {
+            MenuBarMenu()
+                .environment(manager)
+                .environment(configStore)
+                .environment(macroEngine)
+                .onAppear { setupOnce() }
+        } label: {
+            menuBarLabel
+        }
+
+        // Main window (opened from menu bar)
+        Window("DisplayPad Controller", id: "main") {
             MainView()
                 .environment(manager)
                 .environment(configStore)
                 .environment(macroEngine)
-                .onAppear { setup() }
         }
-        .windowStyle(.titleBar)
         .defaultSize(width: 720, height: 400)
 
         Settings {
@@ -72,8 +83,22 @@ struct DisplayPadControllerApp: App {
         }
     }
 
-    private func setup() {
-        // Wire macro engine to device manager
+    @ViewBuilder
+    private var menuBarLabel: some View {
+        switch manager.connectionState {
+        case .connected:
+            Image(systemName: "keyboard.fill")
+        case .disconnected:
+            Image(systemName: "keyboard")
+        case .connecting, .booting:
+            Image(systemName: "keyboard.badge.ellipsis")
+        }
+    }
+
+    private func setupOnce() {
+        guard !hasSetup else { return }
+        hasSetup = true
+
         macroEngine.loadFromConfig(configStore)
 
         manager.onKeyDown = { keyNum in
@@ -86,10 +111,8 @@ struct DisplayPadControllerApp: App {
             pushAllIcons(manager: manager, macroEngine: macroEngine, configStore: configStore)
         }
 
-        // Hotplug monitoring
         hotplugMonitor.onDeviceConnected = { [manager, configStore] in
             if configStore.config.autoConnect {
-                // Disconnect first (no-op if already disconnected), then reconnect after delay
                 manager.disconnect()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
                     manager.connect()
@@ -101,9 +124,79 @@ struct DisplayPadControllerApp: App {
         }
         hotplugMonitor.startMonitoring()
 
-        // Auto-connect on launch
         if configStore.config.autoConnect {
             manager.connect()
+        }
+    }
+}
+
+// MARK: - App Delegate (hide dock icon, keep only menu bar)
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Hide from Dock — menu bar only
+        NSApp.setActivationPolicy(.accessory)
+    }
+}
+
+// MARK: - Menu Bar Dropdown
+
+struct MenuBarMenu: View {
+    @Environment(DisplayPadManager.self) private var manager
+    @Environment(ConfigStore.self) private var configStore
+    @Environment(MacroEngine.self) private var macroEngine
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        // Status
+        Text(statusText)
+            .font(.headline)
+
+        Divider()
+
+        // Connect / Disconnect
+        if manager.connectionState == .connected {
+            Button("Disconnect") {
+                manager.disconnect()
+            }
+
+            Button("Push Icons") {
+                pushAllIcons(manager: manager, macroEngine: macroEngine, configStore: configStore)
+            }
+        } else if manager.connectionState == .disconnected {
+            Button("Connect") {
+                manager.connect()
+            }
+        } else {
+            Text("Connecting...")
+                .foregroundStyle(.secondary)
+        }
+
+        Divider()
+
+        Button("Open Window") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        SettingsLink {
+            Text("Settings...")
+        }
+
+        Divider()
+
+        Button("Quit") {
+            NSApplication.shared.terminate(nil)
+        }
+        .keyboardShortcut("q")
+    }
+
+    private var statusText: String {
+        switch manager.connectionState {
+        case .connected: "DisplayPad Connected"
+        case .disconnected: "DisplayPad Disconnected"
+        case .connecting: "Connecting..."
+        case .booting(let msg): msg
         }
     }
 }

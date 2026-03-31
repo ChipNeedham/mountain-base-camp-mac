@@ -7,7 +7,7 @@ BUILD_DIR=".build/release"
 APP_DIR="${BUNDLE_NAME}.app"
 
 echo "=== Building Release ==="
-swift build -c release 2>&1
+arch -arm64 swift build -c release 2>&1
 
 echo ""
 echo "=== Creating App Bundle ==="
