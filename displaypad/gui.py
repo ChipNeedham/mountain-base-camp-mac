@@ -213,23 +213,41 @@ class DisplayPadApp:
                 self.engine.register(macro)
 
     def _connect_device(self):
-        """Try to connect to the DisplayPad."""
-        try:
-            self.device = DisplayPad()
-            self.device.open()
-            self.device.on_key_down(self.engine.handle_key_down)
-            self.device.on_key_up(self.engine.handle_key_up)
-            self.device.start_listening()
+        """Try to connect to the DisplayPad (runs in background thread)."""
+        self.status_label.configure(text="Connecting...", fg="#FFA500")
+        self.connect_btn.configure(state=tk.DISABLED)
 
-            self.status_label.configure(text="Connected", fg="#1DB954")
-            self.connect_btn.configure(text="Disconnect", command=self._disconnect_device)
-            self.push_btn.configure(state=tk.NORMAL)
+        def do_connect():
+            try:
+                dev = DisplayPad()
+                dev.open()
+                self.root.after(0, lambda: self._on_connected(dev))
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._on_connect_failed(msg))
 
-            self._rebuild_macros()
-            self._push_all()
+        threading.Thread(target=do_connect, daemon=True).start()
 
-        except Exception as e:
-            messagebox.showerror("Connection Failed", str(e))
+    def _on_connected(self, dev):
+        """Called on main thread after successful connection."""
+        self.device = dev
+        self.device.on_key_down(self.engine.handle_key_down)
+        self.device.on_key_up(self.engine.handle_key_up)
+
+        self.status_label.configure(text="Connected", fg="#1DB954")
+        self.connect_btn.configure(
+            text="Disconnect", command=self._disconnect_device, state=tk.NORMAL
+        )
+        self.push_btn.configure(state=tk.NORMAL)
+
+        self._rebuild_macros()
+        self._push_all()
+
+    def _on_connect_failed(self, error_msg):
+        """Called on main thread after failed connection."""
+        self.status_label.configure(text="Disconnected", fg="#e94560")
+        self.connect_btn.configure(state=tk.NORMAL)
+        messagebox.showerror("Connection Failed", error_msg)
 
     def _disconnect_device(self):
         """Disconnect from the DisplayPad."""
@@ -242,21 +260,18 @@ class DisplayPadApp:
         self.push_btn.configure(state=tk.DISABLED)
 
     def _push_all(self):
-        """Push all configured icons to the device."""
+        """Queue all configured icons — worker loop (on USB thread) will send them."""
         if not self.device or not self.device.initialized:
             return
 
         self._rebuild_macros()
 
-        def push():
-            for key_idx in range(NUM_KEYS):
-                macro = self.engine.macros.get(key_idx)
-                if macro:
-                    self.device.set_key_image(key_idx, macro.icon)
-                else:
-                    self.device.clear_key(key_idx)
-
-        threading.Thread(target=push, daemon=True).start()
+        for key_idx in range(NUM_KEYS):
+            macro = self.engine.macros.get(key_idx)
+            if macro:
+                self.device.set_key_image(key_idx, macro.icon)
+            else:
+                self.device.clear_key(key_idx)
 
     def _save(self):
         save_config(self.config)

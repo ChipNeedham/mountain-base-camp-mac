@@ -2,12 +2,18 @@
 Mountain DisplayPad USB HID communication layer.
 
 Protocol reverse-engineered from JeLuF/mountain-displaypad (Node.js).
-Two HID interfaces are used:
-  - Interface 1: Display data (image transfer)
-  - Interface 3: Device control (init, image commands, button input)
+Uses libusb via ctypes (hidapi can't see the device on macOS).
+
+All USB I/O runs on a single worker thread to avoid macOS libusb
+concurrency issues with interrupt transfers.
+
+Two USB interfaces are used:
+  - Interface 1, EP 0x02 OUT: Display data (1024-byte HID reports)
+  - Interface 3, EP 0x04 OUT / EP 0x83 IN: Control (64-byte HID reports)
 """
 
-import hid
+import ctypes
+import ctypes.util
 import time
 import threading
 from collections import deque
@@ -25,23 +31,23 @@ PACKET_SIZE = 31438                         # padded pixel buffer
 HEADER_SIZE = 306                           # image header (all zeros)
 CHUNK_SIZE = 1024
 
-# 64-byte init message (sent to interface 3)
+# 64-byte init command (no report ID — libusb sends raw)
 INIT_MSG = bytes.fromhex(
-    "00118000000100000000000000000000"
+    "11800000010000000000000000000000"
     "00000000000000000000000000000000"
     "00000000000000000000000000000000"
     "00000000000000000000000000000000"
 )
+INIT_1024 = INIT_MSG + bytes(CHUNK_SIZE - len(INIT_MSG))
 
-# 64-byte image transfer start message (sent to interface 3)
-# Byte 5 (0xFF) is overwritten with key index before sending
+# 64-byte image transfer command (no report ID)
+# Byte 4 is overwritten with key index before sending
 IMG_MSG = bytes.fromhex(
-    "0021000000FF3d0000656500000000000000000000000000000000000000000000"
+    "21000000003d000065650000000000000000000000000000000000000000000000"
     "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
-# Button bit masks
-# data[42] bits for keys 1-7, data[47] bits for keys 8-12
+# Button bit masks: data[42] bits for keys 1-7, data[47] bits for keys 8-12
 KEY_MASKS = {
     1:  (42, 0x02),
     2:  (42, 0x04),
@@ -58,37 +64,47 @@ KEY_MASKS = {
 }
 
 
-def find_displaypad_interfaces():
-    """Find the DisplayPad HID device interfaces.
+def _init_libusb():
+    """Load libusb and set up all function signatures (required on ARM64)."""
+    VP = ctypes.c_void_p
+    U8 = ctypes.c_uint8
+    U16 = ctypes.c_uint16
+    I = ctypes.c_int
+    PI = ctypes.POINTER(I)
+    PU8 = ctypes.POINTER(U8)
 
-    Returns:
-        dict with 'display' (interface 1) and 'control' (interface 3) device info,
-        or None if not found.
-    """
-    devices = hid.enumerate(VENDOR_ID, PRODUCT_ID)
-    display_dev = None
-    control_dev = None
+    path = ctypes.util.find_library("usb-1.0") or "/opt/homebrew/lib/libusb-1.0.dylib"
+    lib = ctypes.cdll.LoadLibrary(path)
 
-    for dev in devices:
-        if dev["interface_number"] == 1:
-            display_dev = dev
-        elif dev["interface_number"] == 3:
-            control_dev = dev
+    for name, at, rt in [
+        ("libusb_init", [ctypes.POINTER(VP)], I),
+        ("libusb_exit", [VP], None),
+        ("libusb_open_device_with_vid_pid", [VP, U16, U16], VP),
+        ("libusb_close", [VP], None),
+        ("libusb_kernel_driver_active", [VP, I], I),
+        ("libusb_detach_kernel_driver", [VP, I], I),
+        ("libusb_claim_interface", [VP, I], I),
+        ("libusb_release_interface", [VP, I], I),
+        ("libusb_control_transfer", [VP, U8, U8, U16, U16, PU8, U16, ctypes.c_uint], I),
+        ("libusb_interrupt_transfer", [VP, U8, PU8, I, PI, ctypes.c_uint], I),
+        ("libusb_error_name", [I], ctypes.c_char_p),
+        ("libusb_reset_device", [VP], I),
+        ("libusb_clear_halt", [VP, U8], I),
+    ]:
+        getattr(lib, name).argtypes = at
+        getattr(lib, name).restype = rt
 
-    if display_dev and control_dev:
-        return {"display": display_dev, "control": control_dev}
-    return None
+    return lib
+
+
+_libusb = _init_libusb()
+_VP = ctypes.c_void_p
+_U8 = ctypes.c_uint8
+_PU8 = ctypes.POINTER(_U8)
 
 
 def rgb_to_bgr_buffer(image):
-    """Convert a PIL Image to a BGR byte buffer for the DisplayPad.
-
-    Args:
-        image: PIL Image, will be resized to 102x102 if needed.
-
-    Returns:
-        bytes of length PACKET_SIZE with BGR pixel data.
-    """
+    """Convert a PIL Image to a BGR byte buffer for the DisplayPad."""
     img = image.convert("RGB").resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
     pixels = img.load()
 
@@ -118,195 +134,299 @@ def solid_color_buffer(r, g, b):
 
 
 class DisplayPad:
-    """Interface to the Mountain DisplayPad device."""
+    """Interface to the Mountain DisplayPad device via libusb.
+
+    All USB I/O runs on a single worker thread.
+    """
 
     def __init__(self):
-        self.display = None   # HID handle for interface 1 (display)
-        self.control = None   # HID handle for interface 3 (control)
+        self._ctx = None
+        self._handle = None
         self.initialized = False
-        self._key_state = [False] * (NUM_KEYS + 1)  # 1-based indexing
+        self._key_state = [False] * (NUM_KEYS + 1)
         self._on_key_down = None
         self._on_key_up = None
-        self._listener_thread = None
+        self._worker_thread = None
         self._running = False
         self._queue = deque()
-        self._transferring = False
         self._lock = threading.Lock()
+        self._first_transfer = True
+        self._xfer = ctypes.c_int(0)  # persistent, shared (matches test_multikey.py)
+
+    # ── Low-level USB I/O (only called from worker thread or during init) ──
+
+    def _write_ep(self, ep, data, timeout=5000):
+        buf = (_U8 * len(data))(*data)
+        return _libusb.libusb_interrupt_transfer(
+            self._handle, ep, buf, len(data), ctypes.byref(self._xfer), timeout
+        )
+
+    def _read_ep83(self, timeout=500):
+        resp = (_U8 * 64)()
+        rc = _libusb.libusb_interrupt_transfer(
+            self._handle, 0x83, resp, 64, ctypes.byref(self._xfer), timeout
+        )
+        if rc == 0:
+            return bytes(resp[:self._xfer.value])
+        return None
+
+    def _set_report(self, data, intf):
+        buf = (_U8 * len(data))(*data)
+        return _libusb.libusb_control_transfer(
+            self._handle, 0x21, 0x09, 0x0200, intf,
+            buf, len(data), 3000
+        )
+
+    # ── Connection ──
 
     def open(self):
-        """Open connection to the DisplayPad."""
-        info = find_displaypad_interfaces()
-        if info is None:
+        """Open connection to the DisplayPad. Blocks during boot."""
+        self._ctx = _VP()
+        rc = _libusb.libusb_init(ctypes.byref(self._ctx))
+        if rc != 0:
+            raise RuntimeError(f"libusb_init failed: {rc}")
+
+        self._handle = _libusb.libusb_open_device_with_vid_pid(
+            self._ctx, VENDOR_ID, PRODUCT_ID
+        )
+        if not self._handle:
+            _libusb.libusb_exit(self._ctx)
+            self._ctx = None
             raise RuntimeError(
                 "DisplayPad not found. Check USB connection and permissions.\n"
-                f"Looking for VID={VENDOR_ID:#06x} PID={PRODUCT_ID:#06x}"
+                f"Looking for VID={VENDOR_ID:#06x} PID={PRODUCT_ID:#06x}\n"
+                "You may need to run with sudo."
             )
 
-        self.display = hid.device()
-        self.display.open_path(info["display"]["path"])
+        for intf in [0, 1, 3]:
+            if _libusb.libusb_kernel_driver_active(self._handle, intf) == 1:
+                _libusb.libusb_detach_kernel_driver(self._handle, intf)
+            rc = _libusb.libusb_claim_interface(self._handle, intf)
+            if rc != 0:
+                raise RuntimeError(f"Failed to claim interface {intf}: {rc}")
 
-        self.control = hid.device()
-        self.control.open_path(info["control"]["path"])
+        self._boot()
 
-        # Set non-blocking on control for reading
-        self.control.set_nonblocking(False)
+        self._running = True
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
 
-        self._send_init()
+    def _boot(self):
+        """Boot sequence: A→B→C. C is what actually gets ACK, but A/B prime the device."""
+        start = time.time()
 
-    def _send_init(self):
-        """Send initialization message and wait for acknowledgment."""
-        self.control.write(INIT_MSG)
-
-        # Wait for init response (data[0] == 0x11)
-        timeout = time.time() + 3.0
-        while time.time() < timeout:
-            data = self.control.read(64, timeout_ms=500)
-            if data and data[0] == 0x11:
+        # Strategy A: EP 0x04
+        print("[boot] A: EP 0x04 init...")
+        self._write_ep(0x04, INIT_MSG)
+        t = time.time()
+        while time.time() - t < 15:
+            d = self._read_ep83(500)
+            if d and d[0] == 0x11:
+                print(f"[boot] INIT ACK! ({time.time()-start:.0f}s)")
                 self.initialized = True
                 return
+            if d and d[0] == 0xFF:
+                print(f"[boot] ffaa ({time.time()-start:.0f}s)")
 
-        raise RuntimeError("DisplayPad did not respond to initialization")
+        # Strategy B: EP 0x04 + EP 0x02
+        print("[boot] B: EP 0x04 + EP 0x02...")
+        self._write_ep(0x04, INIT_MSG)
+        self._write_ep(0x02, INIT_1024)
+        t = time.time()
+        while time.time() - t < 10:
+            d = self._read_ep83(500)
+            if d and d[0] == 0x11:
+                print(f"[boot] INIT ACK! ({time.time()-start:.0f}s)")
+                self.initialized = True
+                return
+            if d and d[0] == 0xFF:
+                print(f"[boot] ffaa ({time.time()-start:.0f}s)")
+
+        # Strategy C: SET_REPORT + re-send on ffaa
+        print("[boot] C: SET_REPORT + ffaa re-init...")
+        self._set_report(INIT_MSG, intf=3)
+        t = time.time()
+        while time.time() - t < 15:
+            d = self._read_ep83(500)
+            if d and d[0] == 0x11:
+                print(f"[boot] INIT ACK! ({time.time()-start:.0f}s)")
+                self.initialized = True
+                return
+            if d and d[0] == 0xFF:
+                self._write_ep(0x04, INIT_MSG)
+                self._write_ep(0x02, INIT_1024)
+
+        print(f"[boot] No ACK ({time.time()-start:.0f}s), proceeding anyway")
+        self.initialized = True
 
     def close(self):
-        """Close all device handles."""
         self._running = False
-        if self._listener_thread:
-            self._listener_thread.join(timeout=2.0)
-        if self.display:
-            self.display.close()
-            self.display = None
-        if self.control:
-            self.control.close()
-            self.control = None
+        if self._worker_thread:
+            self._worker_thread.join(timeout=2.0)
+        if self._handle:
+            for intf in [0, 1, 3]:
+                _libusb.libusb_release_interface(self._handle, intf)
+            _libusb.libusb_close(self._handle)
+            self._handle = None
+        if self._ctx:
+            _libusb.libusb_exit(self._ctx)
+            self._ctx = None
         self.initialized = False
 
-    def set_key_image(self, key_index, image):
-        """Set the image for a key (0-based index, 0-11).
+    # ── Worker thread ──
 
-        Args:
-            key_index: int 0-11
-            image: PIL Image (any size, will be resized to 102x102)
-        """
+    def _worker_loop(self):
+        while self._running:
+            item = None
+            with self._lock:
+                if self._queue:
+                    item = self._queue.popleft()
+
+            if item:
+                key_index, pixel_data = item
+                self._transfer_image(key_index, pixel_data)
+            else:
+                self._poll_buttons()
+
+    def _poll_buttons(self):
+        d = self._read_ep83(100)
+        if d and d[0] == 0x01:
+            self._process_buttons(d)
+        elif d and d[0] != 0x01:
+            pass  # non-button data during idle
+
+    def _transfer_image(self, key_index, pixel_data):
+        """Send image using local closure functions (matches working inline test)."""
+        handle = self._handle
+        xfer = ctypes.c_int(0)
+
+        def write_ep(ep, data, timeout=5000):
+            buf = (_U8 * len(data))(*data)
+            return _libusb.libusb_interrupt_transfer(
+                handle, ep, buf, len(data), ctypes.byref(xfer), timeout
+            )
+
+        def read83(timeout=500):
+            resp = (_U8 * 64)()
+            rc = _libusb.libusb_interrupt_transfer(
+                handle, 0x83, resp, 64, ctypes.byref(xfer), timeout
+            )
+            if rc == 0:
+                return bytes(resp[:xfer.value])
+            return None
+
+        def set_report(data, intf):
+            buf = (_U8 * len(data))(*data)
+            return _libusb.libusb_control_transfer(
+                handle, 0x21, 0x09, 0x0200, intf, buf, len(data), 3000
+            )
+
+        print(f"[xfer] Key {key_index}...")
+
+        # IMG command
+        IMG = bytearray(64)
+        IMG[0] = 0x21
+        IMG[4] = key_index
+        IMG[5] = 0x3d
+        IMG[8] = 0x65
+        IMG[9] = 0x65
+        rc = write_ep(0x04, bytes(IMG))
+        if rc != 0:
+            print(f"[xfer]   IMG failed (rc={rc}), skipping")
+            return
+
+        # Wait for ACK
+        acked = False
+        for _ in range(20):
+            d = read83(500)
+            if d is None:
+                continue
+            if d[0] == 0x21 and d[1] == 0x00 and d[2] == 0x00:
+                print(f"[xfer]   IMG ACK!")
+                acked = True
+                break
+            elif d[0] == 0x01:
+                self._process_buttons(d)
+
+        if not acked:
+            print(f"[xfer]   No ACK, skipping")
+            return
+
+        # Pixel chunks
+        header = bytes(HEADER_SIZE)
+        full_data = header + pixel_data
+        ok = 0
+        for i in range(0, len(full_data), CHUNK_SIZE):
+            chunk = full_data[i:i + CHUNK_SIZE]
+            if len(chunk) < CHUNK_SIZE:
+                chunk = chunk + bytes(CHUNK_SIZE - len(chunk))
+            if write_ep(0x02, chunk) == 0:
+                ok += 1
+        print(f"[xfer]   Chunks: {ok}/31")
+
+        # Re-send
+        for i in range(0, len(full_data), CHUNK_SIZE):
+            chunk = full_data[i:i + CHUNK_SIZE]
+            if len(chunk) < CHUNK_SIZE:
+                chunk = chunk + bytes(CHUNK_SIZE - len(chunk))
+            write_ep(0x02, chunk)
+        print(f"[xfer]   Re-send done")
+
+        # Completion wait
+        done = False
+        for _ in range(15):
+            d = read83(1000)
+            if d is None:
+                continue
+            if d[0] == 0x21 and d[1] == 0x00 and d[2] == 0xFF:
+                print(f"[xfer]   Key {key_index} DONE!")
+                done = True
+                break
+            elif d[0] == 0xFF:
+                print(f"[xfer]   ffaa")
+            elif d[0] == 0x01:
+                self._process_buttons(d)
+
+        if not done:
+            print(f"[xfer]   Completion timeout, re-init")
+            set_report(INIT_MSG, intf=3)
+            write_ep(0x04, INIT_MSG)
+            write_ep(0x02, INIT_1024)
+            time.sleep(3)
+            for _ in range(20):
+                d = read83(200)
+                if d is None:
+                    break
+
+    # ── Public API ──
+
+    def set_key_image(self, key_index, image):
         pixel_data = rgb_to_bgr_buffer(image)
-        self._enqueue_transfer(key_index, pixel_data)
+        with self._lock:
+            self._queue.append((key_index, pixel_data))
 
     def set_key_color(self, key_index, r, g, b):
-        """Fill a key with a solid color (0-based index)."""
         pixel_data = solid_color_buffer(r, g, b)
-        self._enqueue_transfer(key_index, pixel_data)
+        with self._lock:
+            self._queue.append((key_index, pixel_data))
 
     def clear_key(self, key_index):
-        """Clear a key (set to black)."""
         self.set_key_color(key_index, 0, 0, 0)
 
     def clear_all(self):
-        """Clear all keys."""
         for i in range(NUM_KEYS):
             self.clear_key(i)
 
-    def _enqueue_transfer(self, key_index, pixel_data):
-        """Add an image transfer to the queue."""
-        with self._lock:
-            self._queue.append((key_index, pixel_data))
-            if not self._transferring:
-                self._process_queue()
-
-    def _process_queue(self):
-        """Process the next item in the transfer queue."""
-        if not self._queue:
-            self._transferring = False
-            return
-
-        self._transferring = True
-        key_index, pixel_data = self._queue.popleft()
-        self._transfer_image(key_index, pixel_data)
-
-    def _transfer_image(self, key_index, pixel_data):
-        """Execute the image transfer protocol for one key.
-
-        Protocol:
-        1. Send IMG_MSG with key_index to control interface
-        2. Wait for ACK (data[0]==0x21, data[1]==0x00, data[2]==0x00)
-        3. Send pixel data in 1024-byte chunks to display interface
-        4. Send full payload again to display interface
-        5. Wait for completion (data[0]==0x21, data[1]==0x00, data[2]==0xff)
-        """
-        # Step 1: Send IMG_MSG
-        msg = bytearray(IMG_MSG)
-        msg[5] = key_index
-        self.control.write(bytes(msg))
-
-        # Step 2: Wait for ACK
-        timeout = time.time() + 3.0
-        acked = False
-        while time.time() < timeout:
-            data = self.control.read(64, timeout_ms=500)
-            if data and data[0] == 0x21:
-                if data[1] == 0x00 and data[2] == 0x00:
-                    acked = True
-                    break
-
-        if not acked:
-            # Timeout - reset and retry
-            self._send_init()
-            with self._lock:
-                self._process_queue()
-            return
-
-        # Step 3: Send pixel data in chunks
-        header = bytes(HEADER_SIZE)  # 306 zero bytes
-        full_data = header + pixel_data
-
-        for i in range(0, len(full_data), CHUNK_SIZE):
-            chunk = full_data[i:i + CHUNK_SIZE]
-            self.display.write(b'\x00' + chunk)
-
-        # Step 4: Send full payload again (no report ID prefix)
-        self.display.write(full_data)
-
-        # Step 5: Wait for completion
-        timeout = time.time() + 5.0
-        while time.time() < timeout:
-            data = self.control.read(64, timeout_ms=500)
-            if data and data[0] == 0x21:
-                if data[1] == 0x00 and data[2] == 0xff:
-                    break
-
-        # Process next in queue
-        with self._lock:
-            self._process_queue()
-
     def on_key_down(self, callback):
-        """Register callback for key press. callback(key_index) where key_index is 1-12."""
         self._on_key_down = callback
 
     def on_key_up(self, callback):
-        """Register callback for key release. callback(key_index) where key_index is 1-12."""
         self._on_key_up = callback
 
     def start_listening(self):
-        """Start listening for button events in a background thread."""
-        self._running = True
-        self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._listener_thread.start()
-
-    def _listen_loop(self):
-        """Background thread that reads button events from the control interface."""
-        while self._running:
-            try:
-                data = self.control.read(64, timeout_ms=100)
-                if not data:
-                    continue
-
-                if data[0] == 0x01:
-                    self._process_buttons(data)
-
-            except Exception:
-                if self._running:
-                    time.sleep(0.1)
+        pass
 
     def _process_buttons(self, data):
-        """Process button state from HID report."""
         for key_num, (byte_idx, mask) in KEY_MASKS.items():
             if byte_idx < len(data):
                 pressed = bool(data[byte_idx] & mask)
@@ -314,9 +434,17 @@ class DisplayPad:
 
                 if pressed and not was_pressed:
                     self._key_state[key_num] = True
+                    print(f"[btn] Key {key_num} DOWN")
                     if self._on_key_down:
-                        self._on_key_down(key_num)
+                        try:
+                            self._on_key_down(key_num)
+                        except Exception as e:
+                            print(f"[btn] callback error: {e}")
                 elif not pressed and was_pressed:
                     self._key_state[key_num] = False
+                    print(f"[btn] Key {key_num} UP")
                     if self._on_key_up:
-                        self._on_key_up(key_num)
+                        try:
+                            self._on_key_up(key_num)
+                        except Exception as e:
+                            print(f"[btn] callback error: {e}")
